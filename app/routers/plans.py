@@ -183,7 +183,7 @@ def get_plan_overview(plan_id: str, db: Session = Depends(get_db)):
 
 @router.put("/{plan_id}/reschedule")
 def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Session = Depends(get_db)):
-    """缺课重排：将漏掉的训练改到新日期"""
+    """缺课重排：将漏掉的训练改到新日期，支持往前和往后挪动"""
     plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="训练计划不存在")
@@ -198,36 +198,74 @@ def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Ses
     if missed_workout.status == "completed":
         raise HTTPException(status_code=400, detail="已完成的训练无法重排")
 
+    original_date = missed_workout.date
+    target_date = reschedule_data.target_date
+
+    if target_date < date.today():
+        raise HTTPException(status_code=400, detail="无法将训练重排到过去的日期")
+
+    if target_date == original_date:
+        return {
+            "message": "日期未变化，无需重排",
+            "rescheduled_workout": {
+                "id": missed_workout.id,
+                "original_date": str(original_date),
+                "new_date": str(target_date),
+                "workout_type": missed_workout.workout_type,
+                "distance": missed_workout.distance
+            },
+            "affected_workouts": 0,
+            "note": "日期相同，无变化"
+        }
+
     conflicting_workout = db.query(Workout).filter(
         Workout.plan_id == plan_id,
-        Workout.date == reschedule_data.target_date,
+        Workout.date == target_date,
         Workout.id != reschedule_data.missed_workout_id
     ).first()
     if conflicting_workout:
         raise HTTPException(
             status_code=400,
-            detail=f"目标日期 {reschedule_data.target_date} 已有训练: {conflicting_workout.workout_type}，请选择其他日期"
+            detail=f"目标日期 {target_date} 已有训练: {conflicting_workout.workout_type}，请选择其他日期"
         )
 
-    if reschedule_data.target_date < date.today():
-        raise HTTPException(status_code=400, detail="无法将训练重排到过去的日期")
+    date_offset = (target_date - original_date).days
 
-    original_date = missed_workout.date
-    missed_workout.date = reschedule_data.target_date
+    if date_offset > 0:
+        future_workouts = db.query(Workout).filter(
+            Workout.plan_id == plan_id,
+            Workout.date > original_date,
+            Workout.date <= target_date,
+            Workout.id != reschedule_data.missed_workout_id
+        ).order_by(Workout.date).all()
 
-    future_workouts = db.query(Workout).filter(
-        Workout.plan_id == plan_id,
-        Workout.date > original_date,
-        Workout.date < reschedule_data.target_date,
-        Workout.id != reschedule_data.missed_workout_id
-    ).order_by(Workout.date).all()
+        for workout in future_workouts:
+            workout.date = workout.date - timedelta(days=1)
+    else:
+        past_workouts = db.query(Workout).filter(
+            Workout.plan_id == plan_id,
+            Workout.date < original_date,
+            Workout.date >= target_date,
+            Workout.id != reschedule_data.missed_workout_id
+        ).order_by(Workout.date.desc()).all()
 
-    date_offset = (reschedule_data.target_date - original_date).days
-    for workout in future_workouts:
-        workout.date = workout.date + timedelta(days=date_offset)
+        for workout in past_workouts:
+            workout.date = workout.date + timedelta(days=1)
+
+    missed_workout.date = target_date
+
+    start_date = plan.start_date
+    missed_workout.week_number = (target_date - start_date).days // 7 + 1
+    missed_workout.day_number = target_date.weekday()
+
+    for workout in db.query(Workout).filter(Workout.plan_id == plan_id).all():
+        workout.week_number = (workout.date - start_date).days // 7 + 1
+        workout.day_number = workout.date.weekday()
 
     db.commit()
     db.refresh(missed_workout)
+
+    total_workouts = db.query(Workout).filter(Workout.plan_id == plan_id).count()
 
     return {
         "message": "训练重排成功",
@@ -236,8 +274,11 @@ def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Ses
             "original_date": str(original_date),
             "new_date": str(missed_workout.date),
             "workout_type": missed_workout.workout_type,
-            "distance": missed_workout.distance
+            "distance": missed_workout.distance,
+            "week_number": missed_workout.week_number,
+            "day_number": missed_workout.day_number
         },
-        "affected_workouts": len(future_workouts),
-        "note": "后续训练日期已相应调整" if future_workouts else "无后续训练受影响"
+        "affected_workouts": abs(date_offset),
+        "total_workouts": total_workouts,
+        "note": f"后续训练已相应调整，共影响{abs(date_offset)}个训练" if date_offset != 0 else "无其他训练受影响"
     }

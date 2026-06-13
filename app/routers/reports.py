@@ -185,13 +185,15 @@ def get_finish_prediction(
 
 @router.get("/{plan_id}/fatigue")
 def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
-    """疲劳风险提示"""
+    """疲劳风险提示 - 只统计真实完成的打卡记录"""
     plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="训练计划不存在")
 
     user = db.query(User).filter(User.id == plan.user_id).first()
-    workouts = db.query(Workout).filter(Workout.plan_id == plan_id).order_by(Workout.date.desc()).limit(21).all()
+    all_workouts = db.query(Workout).filter(Workout.plan_id == plan_id).order_by(Workout.date.desc()).all()
+
+    completed_workouts = [w for w in all_workouts if w.status == "completed"]
 
     recent_workouts = [
         {
@@ -199,11 +201,14 @@ def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
             "distance": w.actual_distance or w.distance,
             "fatigue_level": w.fatigue_level or 5
         }
-        for w in workouts
+        for w in completed_workouts[:21]
     ]
 
-    current_week_distance = sum(w.actual_distance or w.distance for w in workouts[:7])
-    prev_week_distance = sum(w.actual_distance or w.distance for w in workouts[7:14]) if len(workouts) > 7 else 0
+    recent_7_days = completed_workouts[:7]
+    current_week_distance = sum(w.actual_distance or 0 for w in recent_7_days if w.actual_distance)
+
+    recent_14_days = completed_workouts[7:14] if len(completed_workouts) > 7 else []
+    prev_week_distance = sum(w.actual_distance or 0 for w in recent_14_days if w.actual_distance)
     mileage_increase = ((current_week_distance - prev_week_distance) / prev_week_distance * 100) if prev_week_distance > 0 else 0
 
     fatigue_risk = FatigueTracker.calculate_fatigue_risk(
