@@ -78,16 +78,53 @@ class PlanGenerator:
             workout_date = week_start + timedelta(days=day_num)
             if day_num == 6 and len(days_to_train) > 0:
                 workout = self._create_long_run(workout_date, week_num, day_idx, weekly_distance * 0.4, phase)
+                workouts.append(workout)
+
+                if len(days_to_train) == 7 and phase in ["peak", "build", "taper"]:
+                    stretch_date = week_start + timedelta(days=0)
+                    stretch_workout = self._create_stretch_workout(stretch_date, week_num, 0)
+                    workouts.append(stretch_workout)
+                elif phase in ["base", "build"] and 0 not in days_to_train:
+                    stretch_date = workout_date + timedelta(days=1)
+                    stretch_workout = self._create_stretch_workout(stretch_date, week_num, day_idx + 1)
+                    workouts.append(stretch_workout)
+
             elif day_num in [1, 3]:
-                workout = self._create_interval_workout(workout_date, week_num, day_idx, distance_per_day * 0.8, phase)
+                if phase == "build" and day_num == 1:
+                    workout = self._create_interval_workout(workout_date, week_num, day_idx, distance_per_day * 0.8, phase)
+                else:
+                    workout = self._create_easy_run(workout_date, week_num, day_idx, distance_per_day * 0.7, phase)
+                workouts.append(workout)
+
             elif day_num == 4:
                 workout = self._create_tempo_workout(workout_date, week_num, day_idx, distance_per_day * 0.9, phase)
-            elif day_num == 2 or day_num == 5:
-                workout = self._create_easy_run(workout_date, week_num, day_idx, distance_per_day * 0.7, phase)
+                workouts.append(workout)
+
+            elif day_num == 2:
+                workout = self._create_easy_run(workout_date, week_num, day_idx, distance_per_day * 0.6, phase)
+                workouts.append(workout)
+
+            elif day_num == 5:
+                if phase == "peak" and week_num % 2 == 0:
+                    test_distance = distance_per_day * 0.8
+                    workout = self._create_test_run(workout_date, week_num, day_idx, test_distance, phase)
+                else:
+                    workout = self._create_easy_run(workout_date, week_num, day_idx, distance_per_day * 0.5, phase)
+                workouts.append(workout)
+
             else:
                 workout = self._create_easy_run(workout_date, week_num, day_idx, distance_per_day * 0.6, phase)
+                workouts.append(workout)
 
-            workouts.append(workout)
+        if phase in ["base", "build"]:
+            if 5 in days_to_train:
+                strength_date = week_start + timedelta(days=5)
+                strength_workout = self._create_strength_workout(strength_date, week_num, 5)
+                workouts.append(strength_workout)
+            elif 6 in days_to_train:
+                strength_date = week_start + timedelta(days=6)
+                strength_workout = self._create_strength_workout(strength_date, week_num, 6)
+                workouts.append(strength_workout)
 
         if 2 not in days_to_train and 5 not in days_to_train:
             rest_day = 2 if 2 not in days_to_train else 5
@@ -222,6 +259,61 @@ class PlanGenerator:
             "description": "休息日，充分恢复",
             "gear_reminder": None,
             "nutrition_tip": "注意补充蛋白质和碳水化合物"
+        }
+
+    def _create_strength_workout(self, workout_date: date, week: int, day: int) -> Dict:
+        """创建力量训练"""
+        return {
+            "date": workout_date,
+            "week_number": week,
+            "day_number": day,
+            "workout_type": "STRENGTH",
+            "distance": 0.0,
+            "duration": 30,
+            "target_pace": None,
+            "pace_zones": [],
+            "description": "核心力量和下肢力量训练，包括深蹲、弓步、平板支撑等",
+            "gear_reminder": "穿着舒适运动服，准备瑜伽垫和哑铃（如有）",
+            "nutrition_tip": "训练后补充蛋白质促进肌肉恢复"
+        }
+
+    def _create_stretch_workout(self, workout_date: date, week: int, day: int) -> Dict:
+        """创建拉伸恢复"""
+        return {
+            "date": workout_date,
+            "week_number": week,
+            "day_number": day,
+            "workout_type": "STRETCH",
+            "distance": 0.0,
+            "duration": 20,
+            "target_pace": None,
+            "pace_zones": [],
+            "description": "跑后拉伸，重点拉伸腿部肌肉、髋关节和足踝",
+            "gear_reminder": "准备瑜伽垫，可以配合泡沫轴使用",
+            "nutrition_tip": "拉伸后补充水分和电解质"
+        }
+
+    def _create_test_run(self, workout_date: date, week: int, day: int, distance: float, phase: str) -> Dict:
+        """创建测试跑"""
+        if phase == "peak":
+            target_pace = self.current_pace * 0.95
+            description = f"赛前测试跑 {distance:.1f}km，模拟比赛配速"
+        else:
+            target_pace = self.current_pace * 1.0
+            description = f"能力测试 {distance:.1f}km，评估当前跑步能力"
+
+        return {
+            "date": workout_date,
+            "week_number": week,
+            "day_number": day,
+            "workout_type": "TEST_RUN",
+            "distance": round(distance, 1),
+            "duration": int(distance * (target_pace / 60)),
+            "target_pace": PaceCalculator.seconds_to_pace(target_pace),
+            "pace_zones": self._get_pace_zones(target_pace),
+            "description": description,
+            "gear_reminder": GEAR_TIPS["TEST_RUN"],
+            "nutrition_tip": NUTRITION_TIPS["TEST_RUN"]
         }
 
     def _get_interval_config(self, week: int, phase: str) -> Dict:

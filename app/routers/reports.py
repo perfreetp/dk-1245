@@ -19,10 +19,18 @@ def get_phase_report(plan_id: str, db: Session = Depends(get_db)):
 
     workouts = db.query(Workout).filter(Workout.plan_id == plan_id).order_by(Workout.week_number).all()
 
+    total_weeks = plan.total_weeks
+    phase_distribution = {
+        "base": {"start": 1, "end": int(total_weeks * 0.4)},
+        "build": {"start": int(total_weeks * 0.4) + 1, "end": int(total_weeks * 0.7)},
+        "peak": {"start": int(total_weeks * 0.7) + 1, "end": int(total_weeks * 0.85)},
+        "taper": {"start": int(total_weeks * 0.85) + 1, "end": total_weeks}
+    }
+
     phases = {}
-    for phase_key, phase_config in TRAINING_PHASES.items():
+    for phase_key, phase_range in phase_distribution.items():
         phase_weeks = [w for w in workouts if
-            phase_config.get("start", 1) <= w.week_number <= phase_config.get("end", 20)
+            phase_range["start"] <= w.week_number <= phase_range["end"]
         ]
         if not phase_weeks:
             continue
@@ -33,30 +41,45 @@ def get_phase_report(plan_id: str, db: Session = Depends(get_db)):
         completion_rate = len(completed) / len(phase_weeks) if phase_weeks else 0
 
         avg_pace = None
+        avg_actual_pace = None
         if completed:
-            paces = [w.actual_pace for w in completed if w.actual_pace]
+            paces = [w.target_pace for w in completed if w.target_pace]
+            actual_paces = [w.actual_pace for w in completed if w.actual_pace]
             if paces:
-                avg_pace = sum(paces) / len(paces)
+                avg_pace = sum([PaceCalculator.pace_to_seconds(p) for p in paces]) / len(paces)
+            if actual_paces:
+                avg_actual_pace = sum(actual_paces) / len(actual_paces)
 
         fatigue_trend = FatigueTracker.analyze_fatigue_trend([
-            {"fatigue_level": w.fatigue_level}
-            for w in completed[-7:]
+            {"fatigue_level": w.fatigue_level or 5}
+            for w in completed
         ])
 
+        phase_config = TRAINING_PHASES[phase_key]
         phases[phase_key] = {
             "name": phase_config["name"],
+            "name_en": phase_config["name_en"],
+            "focus": phase_config["focus"],
+            "week_range": f"第{phase_range['start']}-{phase_range['end']}周",
             "weeks": len(phase_weeks),
             "completed_weeks": len(completed),
-            "completion_rate": round(completion_rate, 2),
+            "completion_rate": round(completion_rate * 100, 1),
             "total_distance": round(total_distance, 1),
             "completed_distance": round(completed_distance, 1),
-            "average_pace": PaceCalculator.seconds_to_pace(avg_pace) if avg_pace else None,
-            "fatigue_trend": fatigue_trend
+            "target_pace": PaceCalculator.seconds_to_pace(avg_pace) if avg_pace else None,
+            "actual_pace": PaceCalculator.seconds_to_pace(avg_actual_pace) if avg_actual_pace else None,
+            "fatigue_trend": fatigue_trend,
+            "workout_breakdown": {
+                "total": len(phase_weeks),
+                "completed": len(completed),
+                "missed": len(phase_weeks) - len(completed)
+            }
         }
 
     return {
         "plan_id": plan_id,
         "race_type": plan.race_type,
+        "total_weeks": total_weeks,
         "current_phase": plan.current_phase,
         "phases": phases
     }
@@ -168,35 +191,35 @@ def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="训练计划不存在")
 
     user = db.query(User).filter(User.id == plan.user_id).first()
-    workouts = db.query(Workout).filter(Workout.plan_id == plan_id).order_by(Workout.date.desc()).limit(14).all()
+    workouts = db.query(Workout).filter(Workout.plan_id == plan_id).order_by(Workout.date.desc()).limit(21).all()
 
     recent_workouts = [
         {
-            "intensity": 4 if w.workout_type in ["INTERVAL", "TEMPO_RUN"] else 1,
+            "intensity": 4 if w.workout_type in ["INTERVAL", "TEMPO_RUN", "TEST_RUN"] else (2 if w.workout_type in ["LONG_RUN"] else 1),
+            "distance": w.actual_distance or w.distance,
             "fatigue_level": w.fatigue_level or 5
         }
-        for w in workouts[-7:]
+        for w in workouts
     ]
 
-    if len(workouts) > 1:
-        prev_week_distance = sum(w.distance for w in workouts[-14:-7])
-        current_week_distance = sum(w.distance for w in workouts[-7:])
-        mileage_increase = ((current_week_distance - prev_week_distance) / prev_week_distance * 100) if prev_week_distance > 0 else 0
-    else:
-        mileage_increase = 0
+    current_week_distance = sum(w.actual_distance or w.distance for w in workouts[:7])
+    prev_week_distance = sum(w.actual_distance or w.distance for w in workouts[7:14]) if len(workouts) > 7 else 0
+    mileage_increase = ((current_week_distance - prev_week_distance) / prev_week_distance * 100) if prev_week_distance > 0 else 0
 
     fatigue_risk = FatigueTracker.calculate_fatigue_risk(
         recent_workouts=recent_workouts,
         weekly_mileage_increase=mileage_increase,
-        injury_history=user.injury_history or []
+        injury_history=user.injury_history or [],
+        current_week_distance=current_week_distance
     )
 
-    adjustment = FatigueTracker.suggest_adjustment(fatigue_risk, sum(w.distance for w in workouts[-7:]))
+    adjustment = FatigueTracker.suggest_adjustment(fatigue_risk, current_week_distance)
 
     return {
         "risk_level": fatigue_risk["risk_level"],
         "risk_score": fatigue_risk["risk_score"],
         "risk_factors": fatigue_risk["risk_factors"],
         "recommendation": fatigue_risk["recommendation"],
+        "recent_stats": fatigue_risk.get("recent_stats", {}),
         "adjustment": adjustment
     }

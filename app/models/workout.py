@@ -28,10 +28,9 @@ class Workout(Base):
     actual_pace = Column(Float, nullable=True)
     fatigue_level = Column(Integer, nullable=True)
     completed_at = Column(DateTime, nullable=True)
-    checkin_id = Column(String, ForeignKey("checkins.id"), nullable=True)
 
     plan = relationship("TrainingPlan", back_populates="workouts")
-    checkin = relationship("CheckIn", back_populates="workout", uselist=False)
+    checkin = relationship("CheckIn", back_populates="workout", uselist=False, foreign_keys="CheckIn.workout_id")
     coach_comments = relationship("CoachComment", back_populates="workout")
 
 
