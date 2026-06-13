@@ -252,26 +252,6 @@ def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
     elif current_week_distance < prev_week_distance * 0.9:
         load_trend = "decreasing"
 
-    two_week_trend = {
-        "week1": {
-            "total_distance": round(week1_total_distance, 1),
-            "high_intensity_count": week1_high,
-            "avg_fatigue": round(week1_avg_fatigue, 1),
-            "workout_count": len(week1_workouts)
-        },
-        "week2": {
-            "total_distance": round(week2_total_distance, 1),
-            "high_intensity_count": week2_high,
-            "avg_fatigue": round(week2_avg_fatigue, 1),
-            "workout_count": len(week2_workouts)
-        },
-        "trends": {
-            "intensity_trend": intensity_trend,
-            "load_trend": load_trend,
-            "description": _generate_trend_description(intensity_trend, load_trend, current_week_high_intensity, week2_high)
-        }
-    }
-
     return {
         "risk_level": fatigue_risk["risk_level"],
         "risk_score": fatigue_risk["risk_score"],
@@ -279,13 +259,27 @@ def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
         "recommendation": fatigue_risk["recommendation"],
         "recent_stats": fatigue_risk.get("recent_stats", {}),
         "adjustment": adjustment,
-        "two_week_trend": two_week_trend
+        "date_windows": {
+            "last_7_days": stats_7d,
+            "last_14_days": stats_14d,
+            "last_28_days": stats_28d
+        },
+        "trends": {
+            "intensity_trend": intensity_trend,
+            "load_trend": load_trend,
+            "description": _generate_trend_description(intensity_trend, load_trend, stats_7d, stats_14d)
+        }
     }
 
 
-def _generate_trend_description(intensity_trend: str, load_trend: str, current_high: int, prev_high: int) -> str:
+def _generate_trend_description(intensity_trend: str, load_trend: str, current_stats: dict, prev_stats: dict) -> str:
     """生成负荷走势描述"""
     descriptions = []
+
+    current_high = current_stats.get("high_intensity_count", 0)
+    prev_high = prev_stats.get("high_intensity_count", 0)
+    current_recovery = current_stats.get("recovery_ratio", 0)
+    current_distance = current_stats.get("total_distance", 0)
 
     if intensity_trend == "increasing":
         descriptions.append(f"高强度训练增加({prev_high}次→{current_high}次)")
@@ -310,5 +304,96 @@ def _generate_trend_description(intensity_trend: str, load_trend: str, current_h
         return "📊 跑量增加但强度降低，以有氧基础训练为主"
     elif intensity_trend == "decreasing" and load_trend == "decreasing":
         return "🔽 训练强度和负荷双回落，侧重恢复和休息"
+    elif current_recovery > 50:
+        return "🧘 以恢复训练为主，负荷正在回落，注意休息"
+    elif current_distance < 10:
+        return "⚠️ 训练量较低，可能存在缺练或恢复期"
     else:
         return "➡️ 训练状态稳定，保持当前节奏"
+
+
+@router.get("/{plan_id}/summary")
+def get_training_summary(plan_id: str, db: Session = Depends(get_db)):
+    """训练复盘汇总 - 本周、本月、整个周期的完成情况"""
+    plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="训练计划不存在")
+
+    all_workouts = db.query(Workout).filter(Workout.plan_id == plan_id).all()
+    completed_workouts = [w for w in all_workouts if w.status == "completed"]
+
+    checkins = db.query(CheckIn).filter(CheckIn.user_id == plan.user_id).all()
+
+    makeup_count = sum(1 for c in checkins if c.notes and "[补录]" in c.notes)
+    undo_count = sum(1 for w in all_workouts if w.notes and "[已撤回]" in w.notes)
+
+    today = date.today()
+    start_of_week = today - timedelta(days=today.weekday())
+    start_of_month = date(today.year, today.month, 1)
+
+    week_workouts = [w for w in all_workouts if w.date >= start_of_week]
+    month_workouts = [w for w in all_workouts if w.date >= start_of_month]
+
+    week_completed = [w for w in week_workouts if w.status == "completed"]
+    month_completed = [w for w in month_workouts if w.status == "completed"]
+
+    def calc_summary(workouts, completed):
+        if not workouts:
+            return {
+                "total_workouts": 0,
+                "completed": 0,
+                "missed": 0,
+                "completion_rate": 0.0,
+                "planned_distance": 0.0,
+                "actual_distance": 0.0,
+                "avg_fatigue": 0.0
+            }
+        planned = sum(w.distance for w in workouts)
+        actual = sum(w.actual_distance or 0 for w in completed)
+        avg_fat = sum(w.fatigue_level or 5 for w in completed) / len(completed) if completed else 0
+        return {
+            "total_workouts": len(workouts),
+            "completed": len(completed),
+            "missed": len(workouts) - len(completed),
+            "completion_rate": round(len(completed) / len(workouts) * 100, 1) if workouts else 0.0,
+            "planned_distance": round(planned, 1),
+            "actual_distance": round(actual, 1),
+            "avg_fatigue": round(avg_fat, 1)
+        }
+
+    week_summary = calc_summary(week_workouts, week_completed)
+    month_summary = calc_summary(month_workouts, month_completed)
+    total_summary = calc_summary(all_workouts, completed_workouts)
+
+    total_planned_distance = sum(w.distance for w in all_workouts)
+    total_actual_distance = sum(w.actual_distance or 0 for w in completed_workouts)
+
+    return {
+        "plan_id": plan_id,
+        "race_type": plan.race_type,
+        "race_date": str(plan.race_date),
+        "plan_start_date": str(plan.start_date),
+        "plan_end_date": str(plan.race_date),
+        "this_week": {
+            "period": f"{start_of_week} 至 {today}",
+            "stats": week_summary
+        },
+        "this_month": {
+            "period": f"{start_of_month} 至 {today}",
+            "stats": month_summary
+        },
+        "entire_plan": {
+            "total_weeks": plan.total_weeks,
+            "stats": total_summary
+        },
+        "activity_stats": {
+            "makeup_count": makeup_count,
+            "undo_count": undo_count,
+            "total_checkins": len(checkins)
+        },
+        "distance_comparison": {
+            "planned": round(total_planned_distance, 1),
+            "actual": round(total_actual_distance, 1),
+            "completion_rate": round(total_actual_distance / total_planned_distance * 100, 1) if total_planned_distance > 0 else 0.0
+        }
+    }

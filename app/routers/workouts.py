@@ -336,3 +336,139 @@ def undo_workout(workout_id: str, undo_data: WorkoutUndoRequest, db: Session = D
             "completed_distance": round(completed_distance, 1)
         }
     }
+
+
+@router.get("/calendar")
+def get_monthly_calendar(
+    plan_id: str = Query(...),
+    year: int = Query(...),
+    month: int = Query(..., ge=1, le=12),
+    db: Session = Depends(get_db)
+):
+    """按月查看训练日历 - 返回每天的训练情况"""
+    plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="训练计划不存在")
+
+    start_of_month = date(year, month, 1)
+    if month == 12:
+        end_of_month = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_of_month = date(year, month + 1, 1) - timedelta(days=1)
+
+    month_workouts = db.query(Workout).filter(
+        Workout.plan_id == plan_id,
+        Workout.date >= start_of_month,
+        Workout.date <= end_of_month
+    ).order_by(Workout.date).all()
+
+    calendar = []
+    current_date = start_of_month
+    while current_date <= end_of_month:
+        day_workouts = [w for w in month_workouts if w.date == current_date]
+
+        day_info = {
+            "date": str(current_date),
+            "day_of_week": current_date.weekday(),
+            "day_name": ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][current_date.weekday()],
+            "has_workout": len(day_workouts) > 0,
+            "workout_count": len(day_workouts),
+            "workouts": []
+        }
+
+        for w in day_workouts:
+            day_info["workouts"].append({
+                "id": w.id,
+                "workout_type": w.workout_type,
+                "distance": w.distance,
+                "duration": w.duration,
+                "target_pace": w.target_pace,
+                "description": w.description,
+                "status": w.status,
+                "actual_distance": w.actual_distance,
+                "actual_duration": w.actual_duration,
+                "actual_pace": w.actual_pace,
+                "fatigue_level": w.fatigue_level,
+                "gear_reminder": w.gear_reminder,
+                "nutrition_tip": w.nutrition_tip
+            })
+
+        calendar.append(day_info)
+        current_date += timedelta(days=1)
+
+    month_stats = {
+        "total_days": len(calendar),
+        "days_with_workout": sum(1 for d in calendar if d["has_workout"]),
+        "total_workouts": sum(d["workout_count"] for d in calendar),
+        "completed_workouts": sum(1 for d in calendar for w in d["workouts"] if w["status"] == "completed"),
+        "total_distance": sum(w.distance for d in calendar for w in d["workouts"]),
+        "completed_distance": sum(w["actual_distance"] or 0 for d in calendar for w in d["workouts"] if w["status"] == "completed")
+    }
+
+    return {
+        "plan_id": plan_id,
+        "year": year,
+        "month": month,
+        "month_name": f"{year}年{month}月",
+        "start_date": str(start_of_month),
+        "end_date": str(end_of_month),
+        "calendar": calendar,
+        "month_stats": month_stats
+    }
+
+
+@router.get("/day/{plan_id}")
+def get_day_detail(
+    plan_id: str,
+    target_date: str = Query(..., description="目标日期，格式: YYYY-MM-DD"),
+    db: Session = Depends(get_db)
+):
+    """获取某一天的训练详情 - 与训练列表、周视图数据一致"""
+    plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="训练计划不存在")
+
+    ref_date = date.fromisoformat(target_date)
+    day_workouts = db.query(Workout).filter(
+        Workout.plan_id == plan_id,
+        Workout.date == ref_date
+    ).order_by(Workout.date).all()
+
+    if not day_workouts:
+        raise HTTPException(status_code=404, detail="该日期没有训练安排")
+
+    workouts_detail = []
+    for w in day_workouts:
+        workouts_detail.append({
+            "id": w.id,
+            "workout_type": w.workout_type,
+            "distance": w.distance,
+            "duration": w.duration,
+            "target_pace": w.target_pace,
+            "pace_zones": w.pace_zones,
+            "description": w.description,
+            "notes": w.notes,
+            "status": w.status,
+            "actual_distance": w.actual_distance,
+            "actual_duration": w.actual_duration,
+            "actual_pace": w.actual_pace,
+            "fatigue_level": w.fatigue_level,
+            "gear_reminder": w.gear_reminder,
+            "nutrition_tip": w.nutrition_tip,
+            "completed_at": w.completed_at.isoformat() if w.completed_at else None
+        })
+
+    day_stats = {
+        "total_distance": sum(w.distance for w in day_workouts),
+        "completed_distance": sum(w.actual_distance or 0 for w in day_workouts),
+        "completed_count": sum(1 for w in day_workouts if w.status == "completed"),
+        "total_count": len(day_workouts)
+    }
+
+    return {
+        "plan_id": plan_id,
+        "date": target_date,
+        "day_of_week": ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][ref_date.weekday()],
+        "workouts": workouts_detail,
+        "day_stats": day_stats
+    }
