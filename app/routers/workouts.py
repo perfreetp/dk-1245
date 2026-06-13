@@ -138,3 +138,201 @@ def get_next_week_focus(
 
 
 from datetime import timedelta
+
+from pydantic import BaseModel, Field
+
+
+class WeeklyPlanResponse(BaseModel):
+    week_number: int
+    start_date: date
+    end_date: date
+    total_distance: float
+    workout_count: int
+    completed_count: int
+    workouts: dict
+
+    class Config:
+        from_attributes = True
+
+
+class WorkoutCompletionRequest(BaseModel):
+    actual_distance: float
+    actual_duration: int
+    fatigue_level: int = Field(None, ge=1, le=10)
+    notes: str = None
+
+
+class WorkoutUndoRequest(BaseModel):
+    reason: str = None
+
+
+@router.get("/weekly")
+def get_weekly_plan(
+    plan_id: str = Query(...),
+    reference_date: str = Query(..., description="任意一天的日期，格式: YYYY-MM-DD"),
+    db: Session = Depends(get_db)
+):
+    """按周查看计划 - 给定计划和任意一天，返回这一周每天的训练安排"""
+    plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="训练计划不存在")
+
+    ref_date = date.fromisoformat(reference_date)
+    start_of_week = ref_date - timedelta(days=ref_date.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+
+    week_workouts = db.query(Workout).filter(
+        Workout.plan_id == plan_id,
+        Workout.date >= start_of_week,
+        Workout.date <= end_of_week
+    ).order_by(Workout.date).all()
+
+    workouts_by_day = {}
+    for i in range(7):
+        day_date = start_of_week + timedelta(days=i)
+        day_name = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][i]
+        workouts_on_day = [w for w in week_workouts if w.date == day_date]
+
+        workouts_by_day[day_name] = []
+        for w in workouts_on_day:
+            workouts_by_day[day_name].append({
+                "id": w.id,
+                "workout_type": w.workout_type,
+                "distance": w.distance,
+                "duration": w.duration,
+                "target_pace": w.target_pace,
+                "description": w.description,
+                "status": w.status,
+                "actual_distance": w.actual_distance,
+                "actual_duration": w.actual_duration,
+                "actual_pace": w.actual_pace,
+                "fatigue_level": w.fatigue_level,
+                "gear_reminder": w.gear_reminder,
+                "nutrition_tip": w.nutrition_tip
+            })
+
+    completed_count = sum(1 for w in week_workouts if w.status == "completed")
+    total_distance = sum(w.distance for w in week_workouts)
+
+    current_week_number = (ref_date - plan.start_date).days // 7 + 1
+
+    return {
+        "plan_id": plan_id,
+        "current_week": current_week_number,
+        "week_range": f"{start_of_week} 至 {end_of_week}",
+        "start_date": str(start_of_week),
+        "end_date": str(end_of_week),
+        "total_distance": round(total_distance, 1),
+        "workout_count": len(week_workouts),
+        "completed_count": completed_count,
+        "completion_rate": round(completed_count / len(week_workouts) * 100, 1) if week_workouts else 0,
+        "workouts_by_day": workouts_by_day
+    }
+
+
+@router.post("/{workout_id}/makeup")
+def makeup_workout(workout_id: str, makeup_data: WorkoutCompletionRequest, db: Session = Depends(get_db)):
+    """训练补录 - 漏打卡时手动补一条真实完成记录"""
+    workout = db.query(Workout).filter(Workout.id == workout_id).first()
+    if not workout:
+        raise HTTPException(status_code=404, detail="训练课次不存在")
+
+    if workout.status == "completed":
+        raise HTTPException(status_code=400, detail="该训练已完成，无需补录")
+
+    if makeup_data.actual_distance <= 0 or makeup_data.actual_duration <= 0:
+        raise HTTPException(status_code=400, detail="距离和时长必须大于0")
+
+    actual_pace = (makeup_data.actual_duration * 60) / makeup_data.actual_distance
+
+    workout.actual_distance = makeup_data.actual_distance
+    workout.actual_duration = makeup_data.actual_duration
+    workout.actual_pace = actual_pace
+    workout.fatigue_level = makeup_data.fatigue_level or 5
+    workout.notes = makeup_data.notes
+    workout.status = "completed"
+    workout.completed_at = datetime.utcnow()
+
+    checkin = CheckIn(
+        workout_id=workout_id,
+        user_id=workout.plan.user_id,
+        distance=makeup_data.actual_distance,
+        duration=makeup_data.actual_duration,
+        pace=actual_pace,
+        notes=f"[补录] {makeup_data.notes}" if makeup_data.notes else "[补录]"
+    )
+    db.add(checkin)
+    db.commit()
+    db.refresh(workout)
+
+    plan = workout.plan
+    all_workouts = db.query(Workout).filter(Workout.plan_id == plan.id).all()
+    completed_workouts = [w for w in all_workouts if w.status == "completed"]
+
+    total_distance = sum(w.actual_distance or w.distance for w in all_workouts)
+    completed_distance = sum(w.actual_distance or 0 for w in completed_workouts)
+    completion_rate = len(completed_workouts) / len(all_workouts) * 100 if all_workouts else 0
+
+    return {
+        "message": "训练补录成功",
+        "workout_id": workout_id,
+        "workout_type": workout.workout_type,
+        "actual_distance": workout.actual_distance,
+        "actual_duration": workout.actual_duration,
+        "actual_pace": round(actual_pace, 1),
+        "fatigue_level": workout.fatigue_level,
+        "plan_stats": {
+            "total_workouts": len(all_workouts),
+            "completed_workouts": len(completed_workouts),
+            "completion_rate": round(completion_rate, 1),
+            "total_distance": round(total_distance, 1),
+            "completed_distance": round(completed_distance, 1)
+        }
+    }
+
+
+@router.post("/{workout_id}/undo")
+def undo_workout(workout_id: str, undo_data: WorkoutUndoRequest, db: Session = Depends(get_db)):
+    """撤回训练 - 撤回已完成的打卡记录"""
+    workout = db.query(Workout).filter(Workout.id == workout_id).first()
+    if not workout:
+        raise HTTPException(status_code=404, detail="训练课次不存在")
+
+    if workout.status != "completed":
+        raise HTTPException(status_code=400, detail="该训练未完成，无法撤回")
+
+    checkin = db.query(CheckIn).filter(CheckIn.workout_id == workout_id).first()
+    if checkin:
+        db.delete(checkin)
+
+    workout.actual_distance = None
+    workout.actual_duration = None
+    workout.actual_pace = None
+    workout.fatigue_level = None
+    workout.notes = undo_data.reason or "[已撤回]"
+    workout.status = "scheduled"
+    workout.completed_at = None
+
+    db.commit()
+    db.refresh(workout)
+
+    plan = workout.plan
+    all_workouts = db.query(Workout).filter(Workout.plan_id == plan.id).all()
+    completed_workouts = [w for w in all_workouts if w.status == "completed"]
+
+    total_distance = sum(w.actual_distance or w.distance for w in all_workouts)
+    completed_distance = sum(w.actual_distance or 0 for w in completed_workouts)
+    completion_rate = len(completed_workouts) / len(all_workouts) * 100 if all_workouts else 0
+
+    return {
+        "message": "训练撤回成功",
+        "workout_id": workout_id,
+        "workout_type": workout.workout_type,
+        "plan_stats": {
+            "total_workouts": len(all_workouts),
+            "completed_workouts": len(completed_workouts),
+            "completion_rate": round(completion_rate, 1),
+            "total_distance": round(total_distance, 1),
+            "completed_distance": round(completed_distance, 1)
+        }
+    }

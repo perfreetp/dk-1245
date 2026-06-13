@@ -183,7 +183,7 @@ def get_plan_overview(plan_id: str, db: Session = Depends(get_db)):
 
 @router.put("/{plan_id}/reschedule")
 def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Session = Depends(get_db)):
-    """缺课重排：将漏掉的训练改到新日期，支持往前和往后挪动"""
+    """缺课重排：将漏掉的训练改到新日期，支持往前和往后挪动，自动顺开冲突训练"""
     plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="训练计划不存在")
@@ -218,39 +218,81 @@ def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Ses
             "note": "日期相同，无变化"
         }
 
-    conflicting_workout = db.query(Workout).filter(
-        Workout.plan_id == plan_id,
-        Workout.date == target_date,
-        Workout.id != reschedule_data.missed_workout_id
-    ).first()
-    if conflicting_workout:
-        raise HTTPException(
-            status_code=400,
-            detail=f"目标日期 {target_date} 已有训练: {conflicting_workout.workout_type}，请选择其他日期"
-        )
-
     date_offset = (target_date - original_date).days
 
     if date_offset > 0:
-        future_workouts = db.query(Workout).filter(
+        target_end = target_date + timedelta(days=date_offset)
+        workouts_to_shift = []
+
+        conflict_workouts = db.query(Workout).filter(
             Workout.plan_id == plan_id,
-            Workout.date > original_date,
-            Workout.date <= target_date,
+            Workout.date >= target_date,
+            Workout.date <= target_end,
             Workout.id != reschedule_data.missed_workout_id
         ).order_by(Workout.date).all()
 
-        for workout in future_workouts:
-            workout.date = workout.date - timedelta(days=1)
+        for w in conflict_workouts:
+            workouts_to_shift.append({
+                "id": w.id,
+                "original_date": w.date,
+                "new_date": w.date + timedelta(days=1)
+            })
+            w.date = w.date + timedelta(days=1)
+
+        if workouts_to_shift:
+            next_date = workouts_to_shift[-1]["new_date"] + timedelta(days=1)
+            while True:
+                conflict = db.query(Workout).filter(
+                    Workout.plan_id == plan_id,
+                    Workout.date == next_date
+                ).first()
+                if not conflict:
+                    break
+                workouts_to_shift.append({
+                    "id": conflict.id,
+                    "original_date": conflict.date,
+                    "new_date": next_date + timedelta(days=1)
+                })
+                conflict.date = next_date + timedelta(days=1)
+                next_date = next_date + timedelta(days=1)
+
     else:
-        past_workouts = db.query(Workout).filter(
+        target_start = target_date - timedelta(days=abs(date_offset))
+        workouts_to_shift = []
+
+        conflict_workouts = db.query(Workout).filter(
             Workout.plan_id == plan_id,
-            Workout.date < original_date,
+            Workout.date <= target_start,
             Workout.date >= target_date,
             Workout.id != reschedule_data.missed_workout_id
         ).order_by(Workout.date.desc()).all()
 
-        for workout in past_workouts:
-            workout.date = workout.date + timedelta(days=1)
+        for w in conflict_workouts:
+            workouts_to_shift.append({
+                "id": w.id,
+                "original_date": w.date,
+                "new_date": w.date - timedelta(days=1)
+            })
+            w.date = w.date - timedelta(days=1)
+
+        if workouts_to_shift:
+            prev_date = workouts_to_shift[-1]["new_date"] - timedelta(days=1)
+            while True:
+                if prev_date < plan.start_date:
+                    break
+                conflict = db.query(Workout).filter(
+                    Workout.plan_id == plan_id,
+                    Workout.date == prev_date
+                ).first()
+                if not conflict:
+                    break
+                workouts_to_shift.append({
+                    "id": conflict.id,
+                    "original_date": conflict.date,
+                    "new_date": prev_date - timedelta(days=1)
+                })
+                conflict.date = prev_date - timedelta(days=1)
+                prev_date = prev_date - timedelta(days=1)
 
     missed_workout.date = target_date
 
@@ -267,6 +309,34 @@ def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Ses
 
     total_workouts = db.query(Workout).filter(Workout.plan_id == plan_id).count()
 
+    all_workouts_after = db.query(Workout).filter(Workout.plan_id == plan_id).order_by(Workout.date).all()
+    dates_after = [w.date for w in all_workouts_after]
+    has_conflict = len(dates_after) != len(set(dates_after))
+
+    affected_details = []
+    if date_offset > 0 and 'workouts_to_shift' in locals():
+        for shift in workouts_to_shift:
+            w = db.query(Workout).filter(Workout.id == shift["id"]).first()
+            if w:
+                affected_details.append({
+                    "id": w.id,
+                    "workout_type": w.workout_type,
+                    "original_date": str(shift["original_date"]),
+                    "new_date": str(shift["new_date"]),
+                    "week_number": w.week_number
+                })
+    elif date_offset < 0 and 'workouts_to_shift' in locals():
+        for shift in workouts_to_shift:
+            w = db.query(Workout).filter(Workout.id == shift["id"]).first()
+            if w:
+                affected_details.append({
+                    "id": w.id,
+                    "workout_type": w.workout_type,
+                    "original_date": str(shift["original_date"]),
+                    "new_date": str(shift["new_date"]),
+                    "week_number": w.week_number
+                })
+
     return {
         "message": "训练重排成功",
         "rescheduled_workout": {
@@ -278,7 +348,10 @@ def reschedule_workout(plan_id: str, reschedule_data: RescheduleRequest, db: Ses
             "week_number": missed_workout.week_number,
             "day_number": missed_workout.day_number
         },
-        "affected_workouts": abs(date_offset),
+        "affected_workouts_count": len(affected_details),
+        "affected_workouts": affected_details,
         "total_workouts": total_workouts,
-        "note": f"后续训练已相应调整，共影响{abs(date_offset)}个训练" if date_offset != 0 else "无其他训练受影响"
+        "has_conflicts": has_conflict,
+        "date_order_valid": not has_conflict,
+        "note": f"已自动顺开冲突训练，共调整{len(affected_details)}个训练" if affected_details else "无其他训练受影响"
     }

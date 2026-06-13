@@ -185,7 +185,7 @@ def get_finish_prediction(
 
 @router.get("/{plan_id}/fatigue")
 def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
-    """疲劳风险提示 - 只统计真实完成的打卡记录"""
+    """疲劳风险提示 - 只统计真实完成的打卡记录，包含两周负荷走势"""
     plan = db.query(TrainingPlan).filter(TrainingPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="训练计划不存在")
@@ -220,11 +220,95 @@ def get_fatigue_risk(plan_id: str, db: Session = Depends(get_db)):
 
     adjustment = FatigueTracker.suggest_adjustment(fatigue_risk, current_week_distance)
 
+    current_week_high_intensity = sum(
+        1 for w in recent_7_days
+        if w.workout_type in ["INTERVAL", "TEMPO_RUN", "TEST_RUN"]
+    )
+    prev_week_high_intensity = sum(
+        1 for w in recent_14_days
+        if w.workout_type in ["INTERVAL", "TEMPO_RUN", "TEST_RUN"]
+    ) if recent_14_days else 0
+
+    week1_workouts = completed_workouts[:7]
+    week2_workouts = completed_workouts[7:14]
+
+    week1_high = sum(1 for w in week1_workouts if w.workout_type in ["INTERVAL", "TEMPO_RUN", "TEST_RUN"])
+    week1_avg_fatigue = sum(w.fatigue_level or 5 for w in week1_workouts) / len(week1_workouts) if week1_workouts else 0
+    week1_total_distance = sum(w.actual_distance or 0 for w in week1_workouts)
+
+    week2_high = sum(1 for w in week2_workouts if w.workout_type in ["INTERVAL", "TEMPO_RUN", "TEST_RUN"])
+    week2_avg_fatigue = sum(w.fatigue_level or 5 for w in week2_workouts) / len(week2_workouts) if week2_workouts else 0
+    week2_total_distance = sum(w.actual_distance or 0 for w in week2_workouts)
+
+    intensity_trend = "stable"
+    if current_week_high_intensity > prev_week_high_intensity:
+        intensity_trend = "increasing"
+    elif current_week_high_intensity < prev_week_high_intensity:
+        intensity_trend = "decreasing"
+
+    load_trend = "stable"
+    if current_week_distance > prev_week_distance * 1.1:
+        load_trend = "increasing"
+    elif current_week_distance < prev_week_distance * 0.9:
+        load_trend = "decreasing"
+
+    two_week_trend = {
+        "week1": {
+            "total_distance": round(week1_total_distance, 1),
+            "high_intensity_count": week1_high,
+            "avg_fatigue": round(week1_avg_fatigue, 1),
+            "workout_count": len(week1_workouts)
+        },
+        "week2": {
+            "total_distance": round(week2_total_distance, 1),
+            "high_intensity_count": week2_high,
+            "avg_fatigue": round(week2_avg_fatigue, 1),
+            "workout_count": len(week2_workouts)
+        },
+        "trends": {
+            "intensity_trend": intensity_trend,
+            "load_trend": load_trend,
+            "description": _generate_trend_description(intensity_trend, load_trend, current_week_high_intensity, week2_high)
+        }
+    }
+
     return {
         "risk_level": fatigue_risk["risk_level"],
         "risk_score": fatigue_risk["risk_score"],
         "risk_factors": fatigue_risk["risk_factors"],
         "recommendation": fatigue_risk["recommendation"],
         "recent_stats": fatigue_risk.get("recent_stats", {}),
-        "adjustment": adjustment
+        "adjustment": adjustment,
+        "two_week_trend": two_week_trend
     }
+
+
+def _generate_trend_description(intensity_trend: str, load_trend: str, current_high: int, prev_high: int) -> str:
+    """生成负荷走势描述"""
+    descriptions = []
+
+    if intensity_trend == "increasing":
+        descriptions.append(f"高强度训练增加({prev_high}次→{current_high}次)")
+    elif intensity_trend == "decreasing":
+        descriptions.append(f"高强度训练减少({prev_high}次→{current_high}次)")
+    else:
+        if current_high > 0:
+            descriptions.append(f"高强度训练保持({current_high}次)")
+
+    if load_trend == "increasing":
+        descriptions.append("训练负荷上升")
+    elif load_trend == "decreasing":
+        descriptions.append("训练负荷回落")
+    else:
+        descriptions.append("训练负荷稳定")
+
+    if intensity_trend == "increasing" and load_trend == "increasing":
+        return "⚠️ 高强度+高负荷同时增加，风险上升，建议密切监测身体状态"
+    elif intensity_trend == "increasing" and load_trend == "decreasing":
+        return "📊 高强度增加但总量减少，训练质量提升，注意恢复"
+    elif intensity_trend == "decreasing" and load_trend == "increasing":
+        return "📊 跑量增加但强度降低，以有氧基础训练为主"
+    elif intensity_trend == "decreasing" and load_trend == "decreasing":
+        return "🔽 训练强度和负荷双回落，侧重恢复和休息"
+    else:
+        return "➡️ 训练状态稳定，保持当前节奏"
